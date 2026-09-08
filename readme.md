@@ -33,6 +33,10 @@ glue-workflow-cf/
 └── README.md
 ```
 
+#### Architecture
+
+![architecture](screenshots/architecture.png)
+
 ---
 
 ## Part 1 — Theory: what is CloudFormation, actually?
