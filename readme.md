@@ -37,22 +37,21 @@ glue-workflow-cf/
 
 ## Part 1 — Theory: what is CloudFormation, actually?
 
-Before touching a command, it helps to know what's going on conceptually.
+*Concepts:*
 
 - **Template**: a YAML (or JSON) text file that *declares* what AWS resources
   you want (buckets, roles, Glue jobs, etc.) and their configuration. You
-  describe the *end state*, not the steps to get there — this is called
+  describe the *end state*, not the steps to get there. This is called
   "declarative" infrastructure, as opposed to writing a script that calls
   the AWS API line by line ("imperative").
 - **Stack**: when you hand a template to CloudFormation, it creates a
-  **stack** — a single, trackable unit that groups all the resources the
+  **stack** which is a single, trackable unit that groups all the resources the
   template defines. Delete the stack, and (by default) every resource it
   created is deleted too. This is the single biggest reason to use
   CloudFormation: no orphaned resources, no manual cleanup.
 - **Resources**: each block under `Resources:` in the template maps to one
   real AWS object (`AWS::S3::Bucket`, `AWS::Glue::Job`, etc.). CloudFormation
-  figures out the order to create them in based on references between them
-  (or you can force order with `DependsOn`, which this template uses).
+  figures out the order to create them in based on references between them.
 - **Parameters**: the "inputs" of the template (e.g. bucket names). Instead
   of hardcoding a name inside the template, you expose it as a parameter so
   the same template can be reused with different values.
@@ -85,7 +84,7 @@ S3 Notification Configuration    (filters to prefix "data/", suffix ".csv")
 Lambda: start-csv-workflow-cf    (checks nothing's already running, then
         │                        calls glue:StartWorkflowRun)
         ▼
-csv-workflow-cf                  (crawler -> job, same as before)
+csv-workflow-cf                  (crawler -> job)
 ```
 
 Two AWS concepts make this work:
@@ -122,20 +121,18 @@ GitHub Actions workflow (.github/workflows/upload-csv.yml)
 aws s3 sync sample-data/ → s3://upload-csv-cf/data/
         │
         ▼
-(same S3 notification → Lambda → Glue chain as before)
+(same S3 notification → Lambda → Glue chain)
 ```
 
 Nothing about the S3/Lambda/Glue side changes — GitHub Actions' only job is
-to become "the thing that uploads the file," using the same trigger path
-you already have.
+to become "the thing that uploads the file," using the same trigger path.
 
 #### Authenticating GitHub Actions to AWS: IAM user + access key
 
 This project authenticates GitHub Actions using a **static IAM user access
 key** — simpler to set up than OIDC federation, at the cost of the key
 being long-lived (it doesn't expire on its own; you rotate it yourself).
-See `github-iam-user.yaml` for the full trade-off discussion. The user's
-permissions are scoped as tightly as the task needs: it can only
+The user's permissions are scoped as tightly as the task needs: it can only
 `s3:PutObject` into `upload-csv-cf/data/*` and `s3:ListBucket` on that one
 bucket — nothing else, in case the key is ever exposed.
 
@@ -153,8 +150,8 @@ aws cloudformation wait stack-create-complete --stack-name github-iam-user-cf
 #### Setup: Step 2 — generate an access key via CLI
 
 Deliberately done via CLI rather than in the CloudFormation template
-itself — that way the secret key is only ever printed to your terminal
-once, not stored anywhere in CloudFormation's stack outputs or event
+itself. This way the secret key is only ever printed on the terminal
+once and it is not stored anywhere in CloudFormation's stack outputs or event
 history.
 
 ```bash
@@ -192,13 +189,15 @@ Watch it in the **Actions** tab of your repo
 ![GitHub Actions deploy pipeline run succeeded](screenshots/github-deploy.png)
 
 Once the Action completes, the same S3 → Lambda → Glue chain you already
-verified takes over — check it exactly as before:
+verified takes over:
 ```bash
 aws logs tail /aws/lambda/start-csv-workflow-cf --since 5m --follow
 aws glue get-workflow-runs --name csv-workflow-cf --max-results 1
 ```
 
-#### A reminder about key rotation
+![workflow detail](screenshots/terminal7.png)
+
+#### Note: Key rotation
 
 Since this key never expires automatically, put a reminder somewhere (a
 calendar note is fine) to rotate it periodically:
