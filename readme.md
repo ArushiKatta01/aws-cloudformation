@@ -68,30 +68,6 @@ Before touching a command, it helps to know what's going on conceptually.
   tracked state and reality diverge — this is called "drift." Best practice
   is to only change stack-managed resources by updating the template.
 
-### Why the job is a *Python Shell* job, not Spark
-
-Glue offers two very different job engines:
-
-| | Spark job (`glueetl`) | Python Shell job (`pythonshell`) — **used here** |
-|---|---|---|
-| Runtime | A managed Spark cluster | A single small Python process, no cluster |
-| Capacity unit | `WorkerType` + `NumberOfWorkers` | `MaxCapacity` in DPUs — **only `0.0625` or `1` allowed** |
-| Libraries | PySpark, `awsglue.transforms`, DynamicFrames | Plain Python + pre-installed `boto3`, `pandas`, `numpy` |
-| Job bookmarks | Supported | **Not supported** |
-| Best for | Large/distributed datasets | Small-to-medium files, simple scripts, lower cost |
-
-Because this is a Python Shell job, `csv_transform_job.py` does not import
-`pyspark` or `awsglue.transforms` at all — it uses `boto3` to list/read/write
-S3 objects and `pandas` to do the transform in memory. That also means the
-job doesn't need to query the Glue Data Catalog to run: it's given the
-source/destination bucket and prefix directly as job arguments
-(`--SRC_BUCKET`, `--SRC_PREFIX`, `--DEST_BUCKET`, `--DEST_PREFIX`).
-
-The crawler still runs first in the workflow — it's kept so the CSV data
-is cataloged and queryable elsewhere (e.g. Athena), and so the workflow
-still demonstrates chaining a crawler into a job — but the job's own logic
-no longer depends on that catalog entry.
-
 ### Automating it: upload a CSV, the whole pipeline runs
 
 By default a Glue Workflow only starts when something explicitly starts it
@@ -185,6 +161,8 @@ history.
 aws iam create-access-key --user-name github-actions-upload-user-cf
 ```
 
+![aws iam create-access-key command output](screenshots/terminal5.png)
+
 This prints a JSON block containing `AccessKeyId` and `SecretAccessKey`.
 **Copy both immediately** — the secret key is shown only this one time; if
 you lose it, delete that key (`aws iam delete-access-key`) and generate a
@@ -209,10 +187,10 @@ The workflow only fires on pushes that touch a `.csv` under `sample-data/`
 (see the `paths` filter in `upload-csv.yml`) — editing the README or
 templates won't trigger it.
 
-Watch it in the **Actions** tab of your repo, or:
-```bash
-gh run watch
-```
+Watch it in the **Actions** tab of your repo
+
+![GitHub Actions deploy pipeline run succeeded](screenshots/github-deploy.png)
+
 Once the Action completes, the same S3 → Lambda → Glue chain you already
 verified takes over — check it exactly as before:
 ```bash
@@ -231,24 +209,6 @@ aws iam update-access-key --user-name github-actions-upload-user-cf --access-key
 # once you've confirmed the new key works in Actions:
 aws iam delete-access-key --user-name github-actions-upload-user-cf --access-key-id <OLD_KEY_ID>
 ```
-
-#### Alternative: OIDC federation (more secure, more setup)
-
-If you'd rather not manage key rotation at all, `github-oidc-role.yaml` in
-this repo sets up **OIDC federation** instead — GitHub exchanges a
-short-lived signed token for temporary AWS credentials on every run, with
-no stored secret except a role ARN (which isn't sensitive on its own). It
-needs an extra one-time step (registering GitHub's OIDC provider with your
-account) and a trust policy scoped to your exact repo/branch. If you want
-to switch to it later:
-1. Deploy `github-oidc-role.yaml` per the comments in that file (check for
-   an existing OIDC provider first with
-   `aws iam list-open-id-connect-providers`).
-2. Swap the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` secrets for a
-   single `AWS_ROLE_ARN` secret.
-3. In `upload-csv.yml`, change the `configure-aws-credentials` step back to
-   `role-to-assume: ${{ secrets.AWS_ROLE_ARN }}` and add `id-token: write`
-   to the job's `permissions` block.
 
 ### Why a Glue *Workflow* specifically?
 
@@ -337,6 +297,16 @@ creates an IAM role with an explicit name (`glue-service-role-cf`) —
 CloudFormation requires this explicit acknowledgment as a safety check
 before it's allowed to create IAM resources.
 
+![create-stack command output](screenshots/terminal1.png)
+
+You can spot-check that the Job resource picked up the right arguments:
+
+```bash
+aws glue get-job --job-name csv-transform-job-cf --query "Job.DefaultArguments"
+```
+
+![Job DefaultArguments query output](screenshots/terminal4.png)
+
 ### Step 3: Upload the Glue script to the newly-created upload bucket
 
 The Job resource pointed at `s3://upload-csv-cf/scripts/csv_transform_job.py`
@@ -348,6 +318,8 @@ the bucket exists, upload the script:
 aws s3 cp glue-scripts/csv_transform_job.py s3://upload-csv-cf/scripts/csv_transform_job.py
 ```
 
+![Uploading the Glue script via aws s3 cp](screenshots/terminal2.png)
+
 ### Step 4: Upload sample data
 
 The crawler is configured to scan `s3://upload-csv-cf/data/`:
@@ -355,6 +327,8 @@ The crawler is configured to scan `s3://upload-csv-cf/data/`:
 ```bash
 aws s3 cp sample-data/sample.csv s3://upload-csv-cf/data/sample.csv
 ```
+
+![Uploading sample data via aws s3 cp](screenshots/terminal3.png)
 
 ### Step 5: Run the workflow
 
@@ -380,6 +354,16 @@ can watch it happen:
 ```bash
 aws glue get-workflow-runs --name csv-workflow-cf --max-results 1
 ```
+
+![CLI output showing a COMPLETED workflow run](screenshots/terminal6.png)
+
+Or watch it in the console — every step in the graph turns green as it
+completes:
+
+![Glue Workflow graph with every step succeeded](screenshots/success-workflow.png)
+
+![csv-workflow-cf workflow details and run history in the console](screenshots/workflow-completed.png)
+
 or check the Lambda's own logs to confirm it fired:
 ```bash
 aws logs tail /aws/lambda/start-csv-workflow-cf --since 5m --follow
@@ -399,8 +383,18 @@ aws glue start-workflow-run --name csv-workflow-cf
 ```bash
 aws s3 ls s3://destination-csv-cf/processed/
 ```
-You should see CSV part-files containing your transformed rows (with a new
-`processed_at` timestamp column).
+![verification output](screenshots/output-verification.png)
+
+In the console, the job's run history should show `Succeeded`:
+
+![csv-transform-job-cf run succeeded in the console](screenshots/job-success.png)
+
+![Job run details page showing run status, duration, and input arguments](screenshots/job-run-details.png)
+
+The job's CloudWatch log group (`/aws-glue/python-jobs/output`) shows the
+script's own `print()` output, confirming exactly what it read and wrote:
+
+![CloudWatch log events from the Python Shell job run](screenshots/log-events.png)
 
 ### Step 7: Tear it down (avoid ongoing charges)
 
@@ -413,59 +407,7 @@ aws s3 rm s3://destination-csv-cf --recursive
 aws cloudformation delete-stack --stack-name glue-csv-workflow-cf
 aws cloudformation wait stack-delete-complete --stack-name glue-csv-workflow-cf
 ```
+---
 This is the payoff of using CloudFormation: one command removes every
 resource the project created — buckets, IAM role, Glue database, crawler,
-job, workflow, and triggers — with no manual cleanup checklist.
-
----
-
-## Part 4 — Common beginner gotchas
-
-- **"Bucket already exists" error on create-stack**: S3 bucket names are
-  global across *all* AWS accounts, not just yours. Change the
-  `UploadBucketName`/`DestinationBucketName` parameters to something unique
-  (e.g. append your account ID or initials) and redeploy.
-- **Crawler runs but finds 0 tables**: make sure you uploaded `sample.csv`
-  under the `data/` prefix specifically (`s3://upload-csv-cf/data/...`), not
-  the bucket root — that's the exact path the crawler is scoped to.
-- **Job fails with "script not found"**: you must upload
-  `csv_transform_job.py` to `s3://upload-csv-cf/scripts/` *after* the stack
-  is created — the template only reserves the path, it doesn't put the file
-  there for you.
-- **Updating the template later**: use `aws cloudformation update-stack`
-  (or “Update” in the console) rather than deleting and recreating — this
-  preserves anything the update doesn't touch and only modifies what
-  changed.
-- **`MaxCapacity` validation error on the Job resource**: Python Shell jobs
-  only accept `0.0625` or `1` for `MaxCapacity` — any other number (or
-  `WorkerType`/`NumberOfWorkers`, which are Spark-only) will fail to deploy.
-- **`ModuleNotFoundError` for pandas/boto3**: these come pre-installed in
-  the Python Shell environment — you should never need to pip-install them.
-  If you add a library that *isn't* pre-installed, you'd need
-  `--additional-python-modules` in `DefaultArguments` (not covered here).
-- **Job runs but produces no output**: check the CloudWatch Logs group for
-  the job run first — Python Shell jobs print plain `print()` output there,
-  which is the fastest way to see exactly which step failed.
-- **Uploading a CSV doesn't trigger anything**: confirm the notification
-  actually attached — `aws s3api get-bucket-notification-configuration
-  --bucket upload-csv-cf` should show the `LambdaFunctionConfigurations`
-  block. If it's empty, the stack update that adds it may not have
-  completed — re-run the `update-stack` command in Step 5 and wait for
-  `UPDATE_COMPLETE`.
-- **File uploaded outside `data/` or without a `.csv` extension**: the
-  notification filter only matches `data/*.csv` — anything else (e.g. a
-  file in `scripts/` or a `.txt` file) is silently ignored by design.
-- **Two files uploaded seconds apart only produce one workflow run**:
-  expected — the Lambda checks for an already-`RUNNING` workflow run and
-  skips starting a new one to avoid overlapping runs on the same data.
-- **GitHub Actions fails with `InvalidAccessKeyId` or `SignatureDoesNotMatch`**:
-  double-check the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` GitHub
-  secrets were pasted correctly (no extra whitespace/newlines) and that the
-  key hasn't been deactivated or deleted.
-- **`AccessDenied` on `s3:PutObject` from Actions**: confirm you deployed
-  `github-iam-user.yaml` (not skipped it) and that `UploadBucketName`
-  passed to that stack matches the bucket name in the main stack exactly.
-- **Push doesn't trigger the Action at all**: confirm the changed file is
-  actually under `sample-data/` and ends in `.csv` — the workflow's `paths`
-  filter ignores everything else, including changes to `template.yaml` or
-  `README.md`.
+job, workflow, and triggers.
