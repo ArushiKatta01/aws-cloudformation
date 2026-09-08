@@ -1,0 +1,47 @@
+name: Upload CSV to S3
+
+# Only runs when a push to main actually touches a .csv file under
+# sample-data/. Pushes that don't touch any CSV (e.g. editing the README,
+# or the CloudFormation templates) are ignored - "paths" filtering is what
+# makes this selective instead of running on every single push.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sample-data/**.csv"
+
+# contents: read is the default minimum needed for actions/checkout.
+# (No id-token permission needed here - that's only required for OIDC;
+# this workflow authenticates with a static IAM user access key instead.)
+permissions:
+  contents: read
+
+jobs:
+  upload-csv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Authenticates using a long-lived IAM user access key stored as
+      # GitHub Secrets, rather than exchanging a short-lived OIDC token.
+      # Simpler to set up, but the key does not expire on its own - see
+      # github-iam-user.yaml and the README for the trade-offs and the
+      # rotation reminder.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Uploads every CSV under sample-data/ to the upload bucket's data/
+      # prefix. That PutObject is what the S3 NotificationConfiguration in
+      # template.yaml is watching for - it invokes the Lambda, which starts
+      # the Glue workflow. No AWS Glue calls happen here on purpose; this
+      # workflow's only job is "get the file into S3."
+      - name: Sync CSVs to upload bucket
+        run: |
+          aws s3 sync sample-data/ s3://upload-csv-cf/data/ \
+            --exclude "*" \
+            --include "*.csv"

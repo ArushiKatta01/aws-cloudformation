@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  IAM user for GitHub Actions to upload CSVs to S3 using a static access
+  key, as an alternative to OIDC federation. Creates the USER and its
+  permissions only - the access key itself is generated separately via CLI
+  (see README) so the secret key never gets written into CloudFormation's
+  stack outputs or event history.
+
+# ---------------------------------------------------------------------------
+# THEORY: IAM user + access key vs. OIDC
+#
+# An IAM user is a long-term identity in your AWS account. An access key is
+# a username/password-like credential pair (Access Key ID + Secret Access
+# Key) tied to that user. Unlike OIDC-issued credentials, an access key:
+#   - does NOT expire on its own - it's valid until you manually deactivate
+#     or delete it
+#   - is not scoped to a specific repo/branch/workflow - anyone who has the
+#     key pair can use it from anywhere, not just from GitHub Actions
+#   - has to be rotated by YOU on some schedule as a security practice
+#
+# This is simpler to set up (no trust policy conditions, no provider to
+# register) which is why it's a common starting point, but it's a smaller
+# blast radius vs. convenience trade-off you're taking on knowingly. The
+# policy below is scoped as tightly as GitHub Actions actually needs
+# (upload CSVs to one prefix, in one bucket) so that even if the key
+# leaked, the damage it could do is limited to that one prefix.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  UploadBucketName:
+    Type: String
+    Default: upload-csv-cf
+    Description: Must match the UploadBucketName used in the main Glue stack's template.yaml.
+
+Resources:
+  GitHubActionsUploadUserCF:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: github-actions-upload-user-cf
+      Policies:
+        - PolicyName: upload-csv-to-s3-cf
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${UploadBucketName}
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${UploadBucketName}/data/*
+
+Outputs:
+  GitHubActionsUserName:
+    Description: >
+      IAM user name. Use this to generate an access key via CLI:
+      aws iam create-access-key --user-name <this value>
+    Value: !Ref GitHubActionsUploadUserCF

@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Glue CSV processing workflow (CloudFormation edition).
+  Creates: upload bucket, destination bucket, IAM role, Glue Database,
+  Glue Crawler, Glue Job, and a Glue Workflow that chains the crawler -> job.
+
+# ---------------------------------------------------------------------------
+# PARAMETERS
+# Parameters let you reuse this template with different values without
+# editing the file itself. Think of them as the "input fields" of your
+# template - similar to function arguments in code.
+# ---------------------------------------------------------------------------
+Parameters:
+  UploadBucketName:
+    Type: String
+    Default: upload-csv-cf
+    Description: >
+      S3 bucket where source CSV files are uploaded. NOTE: S3 bucket names
+      are globally unique across ALL AWS accounts. If this name is already
+      taken by someone else in the world, stack creation will fail - change
+      it (e.g. upload-csv-cf-yourname) if that happens.
+
+  DestinationBucketName:
+    Type: String
+    Default: destination-csv-cf
+    Description: S3 bucket where the processed/transformed CSV output lands.
+
+  GlueDatabaseName:
+    Type: String
+    Default: csv_database_cf
+    Description: Name of the Glue Data Catalog database that stores table metadata.
+
+  GlueTableName:
+    Type: String
+    Default: data
+    Description: >
+      Name the crawler will give the table it creates. By default the Glue
+      Crawler names a table after the last folder in the crawled S3 path
+      (here that path is s3://<UploadBucket>/data/), so we default this to "data".
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # S3 BUCKETS
+  # -------------------------------------------------------------------------
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref UploadBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DestinationBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # -------------------------------------------------------------------------
+  # IAM ROLE FOR GLUE
+  # Glue needs permission to: assume this role, read/write the two buckets,
+  # write CloudWatch logs, and manage Glue Catalog entries. AWS ships a
+  # managed policy (AWSGlueServiceRole) that covers the generic Glue
+  # permissions; we add an inline policy for our specific S3 buckets.
+  # -------------------------------------------------------------------------
+  GlueServiceRoleCF:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: glue-service-role-cf
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: glue-s3-access-cf
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${UploadBucketName}
+                  - !Sub arn:aws:s3:::${UploadBucketName}/*
+                  - !Sub arn:aws:s3:::${DestinationBucketName}
+                  - !Sub arn:aws:s3:::${DestinationBucketName}/*
+
+  # -------------------------------------------------------------------------
+  # GLUE DATA CATALOG DATABASE
+  # A logical container for table metadata (schemas), similar to a
+  # "database" in a traditional data warehouse, but it holds no data itself -
+  # only pointers/schemas to data sitting in S3.
+  # -------------------------------------------------------------------------
+  GlueDatabaseCF:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Glue Catalog database for the CloudFormation CSV workflow.
+
+  # -------------------------------------------------------------------------
+  # GLUE CRAWLER
+  # Scans the upload bucket's "data/" prefix, infers the CSV schema, and
+  # registers/updates a table in the Glue Database above. This is what lets
+  # the Glue Job later query the CSV data using a schema instead of raw bytes.
+  # -------------------------------------------------------------------------
+  CsvCrawlerCF:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: csv-crawler-cf
+      Role: !GetAtt GlueServiceRoleCF.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${UploadBucketName}/data/
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: >
+        {"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}
+    DependsOn: GlueDatabaseCF
+
+  # -------------------------------------------------------------------------
+  # GLUE ETL JOB
+  # The actual data-processing script (PySpark). It reads the table the
+  # crawler created, applies a transform, and writes CSV output to the
+  # destination bucket. ScriptLocation points at an S3 object that YOU
+  # upload after the stack is created (see README) - CloudFormation does not
+  # validate that the file exists at deploy time, only Glue checks this when
+  # the job actually runs.
+  # -------------------------------------------------------------------------
+  CsvTransformJobCF:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: csv-transform-job-cf
+      Role: !GetAtt GlueServiceRoleCF.Arn
+      GlueVersion: "4.0"
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${UploadBucketName}/scripts/csv_transform_job.py
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-language": "python"
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--TempDir": !Sub s3://${UploadBucketName}/temp/
+        "--DATABASE_NAME": !Ref GlueDatabaseName
+        "--TABLE_NAME": !Ref GlueTableName
+        "--DEST_BUCKET": !Ref DestinationBucketName
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+      MaxRetries: 0
+      Timeout: 30
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+
+  # -------------------------------------------------------------------------
+  # GLUE WORKFLOW
+  # A workflow is an orchestration container: it groups triggers, crawlers
+  # and jobs so they run together as one pipeline, and gives you a single
+  # visual graph in the console to monitor the whole run.
+  # -------------------------------------------------------------------------
+  CsvWorkflowCF:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: csv-workflow-cf
+      Description: Orchestrates the CSV crawler and transform job.
+
+  # -------------------------------------------------------------------------
+  # TRIGGER 1: starts the workflow by running the crawler.
+  # Type ON_DEMAND means it only fires when you manually start the workflow
+  # (console button, or `aws glue start-workflow-run`). This keeps the
+  # beginner setup simple and cost-safe - nothing runs until you tell it to.
+  # -------------------------------------------------------------------------
+  StartCrawlerTriggerCF:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: start-crawler-trigger-cf
+      Type: ON_DEMAND
+      WorkflowName: !Ref CsvWorkflowCF
+      Actions:
+        - CrawlerName: !Ref CsvCrawlerCF
+    DependsOn:
+      - CsvWorkflowCF
+      - CsvCrawlerCF
+
+  # -------------------------------------------------------------------------
+  # TRIGGER 2: starts the ETL job, but ONLY after the crawler succeeds.
+  # Type CONDITIONAL lets you chain steps: "run job B only if crawler A
+  # finished successfully." This is the core of workflow orchestration.
+  # -------------------------------------------------------------------------
+  StartJobTriggerCF:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: start-job-trigger-cf
+      Type: CONDITIONAL
+      WorkflowName: !Ref CsvWorkflowCF
+      StartOnCreation: true
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref CsvCrawlerCF
+            CrawlState: SUCCEEDED
+        Logical: AND
+      Actions:
+        - JobName: !Ref CsvTransformJobCF
+    DependsOn:
+      - CsvWorkflowCF
+      - CsvCrawlerCF
+      - CsvTransformJobCF
+
+# ---------------------------------------------------------------------------
+# OUTPUTS
+# Outputs surface useful values after the stack finishes creating - visible
+# in the console "Outputs" tab, or via `aws cloudformation describe-stacks`.
+# ---------------------------------------------------------------------------
+Outputs:
+  UploadBucketNameOut:
+    Description: Bucket to upload raw CSV files into (under the data/ prefix)
+    Value: !Ref UploadBucketName
+
+  DestinationBucketNameOut:
+    Description: Bucket where processed CSV output will be written
+    Value: !Ref DestinationBucketName
+
+  GlueWorkflowNameOut:
+    Description: Name of the Glue Workflow to start
+    Value: !Ref CsvWorkflowCF
+
+  GlueServiceRoleArnOut:
+    Description: IAM Role ARN used by Glue
+    Value: !GetAtt GlueServiceRoleCF.Arn
