@@ -30,21 +30,37 @@ Parameters:
     Default: csv_database_cf
     Description: Name of the Glue Data Catalog database that stores table metadata.
 
-  GlueTableName:
+  DataPrefix:
     Type: String
-    Default: data
+    Default: data/
     Description: >
-      Name the crawler will give the table it creates. By default the Glue
-      Crawler names a table after the last folder in the crawled S3 path
-      (here that path is s3://<UploadBucket>/data/), so we default this to "data".
+      S3 prefix (folder) under the upload bucket that holds raw CSVs. Used
+      by both the crawler (for cataloging) and the Python Shell job (which
+      reads CSVs from here directly via boto3, independent of the catalog).
+
+  ProcessedPrefix:
+    Type: String
+    Default: processed/
+    Description: S3 prefix under the destination bucket where transformed CSV output is written.
 
 Resources:
 
   # -------------------------------------------------------------------------
   # S3 BUCKETS
+  # UploadBucket has a NotificationConfiguration: whenever a new object is
+  # created under DataPrefix ending in .csv, S3 invokes StartWorkflowFunctionCF
+  # automatically - this is what makes "upload a file -> pipeline runs" work
+  # without you calling start-workflow-run by hand.
+  # DependsOn AllowS3InvokeLambdaCF: S3 validates, at the moment you set a
+  # notification target, that it's already allowed to invoke that Lambda.
+  # If the bucket were created before the permission exists, that check
+  # would fail - DependsOn forces CloudFormation to create the permission
+  # first.
   # -------------------------------------------------------------------------
   UploadBucket:
     Type: AWS::S3::Bucket
+    DependsOn:
+      - AllowS3InvokeLambdaCF
     Properties:
       BucketName: !Ref UploadBucketName
       VersioningConfiguration:
@@ -54,6 +70,17 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt StartWorkflowFunctionCF.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref DataPrefix
+                  - Name: suffix
+                    Value: .csv
 
   DestinationBucket:
     Type: AWS::S3::Bucket
@@ -120,9 +147,13 @@ Resources:
 
   # -------------------------------------------------------------------------
   # GLUE CRAWLER
-  # Scans the upload bucket's "data/" prefix, infers the CSV schema, and
-  # registers/updates a table in the Glue Database above. This is what lets
-  # the Glue Job later query the CSV data using a schema instead of raw bytes.
+  # Scans the upload bucket's data prefix, infers the CSV schema, and
+  # registers/updates a table in the Glue Database above. NOTE: with a
+  # Python Shell job (below), the ETL step itself reads CSVs straight from
+  # S3 via boto3/pandas and does NOT need this catalog table to run - the
+  # crawler is kept here so the data is still discoverable/queryable
+  # elsewhere (e.g. Athena), and so the workflow still demonstrates
+  # crawler -> job chaining.
   # -------------------------------------------------------------------------
   CsvCrawlerCF:
     Type: AWS::Glue::Crawler
@@ -132,7 +163,7 @@ Resources:
       DatabaseName: !Ref GlueDatabaseName
       Targets:
         S3Targets:
-          - Path: !Sub s3://${UploadBucketName}/data/
+          - Path: !Sub s3://${UploadBucketName}/${DataPrefix}
       SchemaChangePolicy:
         UpdateBehavior: UPDATE_IN_DATABASE
         DeleteBehavior: LOG
@@ -141,37 +172,127 @@ Resources:
     DependsOn: GlueDatabaseCF
 
   # -------------------------------------------------------------------------
-  # GLUE ETL JOB
-  # The actual data-processing script (PySpark). It reads the table the
-  # crawler created, applies a transform, and writes CSV output to the
-  # destination bucket. ScriptLocation points at an S3 object that YOU
-  # upload after the stack is created (see README) - CloudFormation does not
-  # validate that the file exists at deploy time, only Glue checks this when
-  # the job actually runs.
+  # GLUE JOB - PYTHON SHELL (strict, no Spark)
+  # A Python Shell job runs plain Python on a single small machine instead
+  # of spinning up a Spark cluster. Key differences from a Spark ("glueetl")
+  # job you should know as a beginner:
+  #   - Command.Name is "pythonshell" (not "glueetl").
+  #   - Capacity is set with MaxCapacity in DPUs, and for Python Shell the
+  #     ONLY valid values are 0.0625 (1/16 DPU) or 1 (1 DPU) - there is no
+  #     WorkerType / NumberOfWorkers, those are Spark-only properties.
+  #   - No job bookmarks (--job-bookmark-option is a Spark-job feature).
+  #   - The script (see glue-scripts/csv_transform_job.py) only has access
+  #     to boto3/pandas - no PySpark, no DynamicFrames.
+  # ScriptLocation points at an S3 object that YOU upload after the stack is
+  # created (see README) - CloudFormation does not validate that the file
+  # exists at deploy time, only Glue checks this when the job actually runs.
   # -------------------------------------------------------------------------
   CsvTransformJobCF:
     Type: AWS::Glue::Job
     Properties:
       Name: csv-transform-job-cf
       Role: !GetAtt GlueServiceRoleCF.Arn
-      GlueVersion: "4.0"
+      GlueVersion: "3.0"
       Command:
-        Name: glueetl
+        Name: pythonshell
         ScriptLocation: !Sub s3://${UploadBucketName}/scripts/csv_transform_job.py
-        PythonVersion: "3"
+        PythonVersion: "3.9"
       DefaultArguments:
         "--job-language": "python"
-        "--job-bookmark-option": "job-bookmark-enable"
+        "--JOB_NAME": "csv-transform-job-cf"
         "--TempDir": !Sub s3://${UploadBucketName}/temp/
-        "--DATABASE_NAME": !Ref GlueDatabaseName
-        "--TABLE_NAME": !Ref GlueTableName
+        "--SRC_BUCKET": !Ref UploadBucketName
+        "--SRC_PREFIX": !Ref DataPrefix
         "--DEST_BUCKET": !Ref DestinationBucketName
-        "--enable-metrics": "true"
-        "--enable-continuous-cloudwatch-log": "true"
+        "--DEST_PREFIX": !Ref ProcessedPrefix
       MaxRetries: 0
       Timeout: 30
-      WorkerType: G.1X
-      NumberOfWorkers: 2
+      MaxCapacity: 0.0625
+
+  # -------------------------------------------------------------------------
+  # AUTOMATION: Lambda that starts the Glue Workflow on new CSV upload
+  # -------------------------------------------------------------------------
+
+  # IAM role for the Lambda. It only needs two things: permission to write
+  # its own CloudWatch logs (the standard AWSLambdaBasicExecutionRole), and
+  # permission to start/inspect THIS specific Glue workflow - scoped tightly
+  # rather than granting glue:* everywhere, following least-privilege.
+  LambdaExecutionRoleCF:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: start-workflow-lambda-role-cf
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: start-glue-workflow-cf
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartWorkflowRun
+                  - glue:GetWorkflowRuns
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:workflow/csv-workflow-cf
+
+  # The function itself. Code is inlined (ZipFile) since it's short - for
+  # anything longer you'd package it as a .zip and reference an S3 location
+  # instead. It checks whether the workflow is already running before
+  # starting a new run, so two CSVs uploaded back-to-back don't kick off
+  # overlapping runs.
+  StartWorkflowFunctionCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: start-csv-workflow-cf
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRoleCF.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3
+
+          WORKFLOW_NAME = "csv-workflow-cf"
+
+          def handler(event, context):
+              glue = boto3.client("glue")
+
+              # Log which S3 object(s) triggered this invocation, for visibility.
+              for record in event.get("Records", []):
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = record["s3"]["object"]["key"]
+                  print(f"Triggered by upload: s3://{bucket}/{key}")
+
+              # Avoid starting an overlapping run if one is already in progress.
+              runs = glue.get_workflow_runs(Name=WORKFLOW_NAME, MaxResults=1)
+              if runs["Runs"] and runs["Runs"][0]["Status"] == "RUNNING":
+                  print(f"Workflow '{WORKFLOW_NAME}' is already running - skipping.")
+                  return {"statusCode": 200, "body": "Skipped - already running"}
+
+              response = glue.start_workflow_run(Name=WORKFLOW_NAME)
+              print(f"Started workflow run: {response['RunId']}")
+              return {"statusCode": 200, "body": response["RunId"]}
+
+  # Grants the S3 SERVICE (not a user/role) permission to invoke this
+  # specific Lambda function, scoped to invocations coming from our upload
+  # bucket. Without this, S3 silently fails to deliver the event - Lambda
+  # rejects invocations from services that aren't explicitly allowed.
+  AllowS3InvokeLambdaCF:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartWorkflowFunctionCF
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${UploadBucketName}
+      SourceAccount: !Ref AWS::AccountId
 
   # -------------------------------------------------------------------------
   # GLUE WORKFLOW
@@ -249,3 +370,7 @@ Outputs:
   GlueServiceRoleArnOut:
     Description: IAM Role ARN used by Glue
     Value: !GetAtt GlueServiceRoleCF.Arn
+
+  StartWorkflowFunctionNameOut:
+    Description: Lambda function that auto-starts the workflow on CSV upload
+    Value: !Ref StartWorkflowFunctionCF
