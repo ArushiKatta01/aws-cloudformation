@@ -279,22 +279,7 @@ same discipline you'd apply to application code ("Infrastructure as Code").
 
 ### Step 2: Deploy the CloudFormation stack
 
-**Option A — AWS Console (easiest for a first run):**
-1. Go to the **CloudFormation** console → **Create stack** → **With new
-   resources (standard)**.
-2. Choose **Upload a template file**, select `template.yaml`.
-3. Give the stack a name, e.g. `glue-csv-workflow-cf`.
-4. On the Parameters screen you'll see `UploadBucketName`,
-   `DestinationBucketName`, etc. pre-filled with the defaults
-   (`upload-csv-cf`, `destination-csv-cf`) — leave them, or change if those
-   bucket names are already taken globally.
-5. Click through **Next** → **Next**, check the box acknowledging
-   CloudFormation may create IAM resources (it needs to, for the Glue
-   role), then **Submit**.
-6. Watch the **Events** tab — it lists every resource as it's created.
-   Wait for stack status `CREATE_COMPLETE`.
-
-**Option B — AWS CLI:**
+**AWS CLI:**
 ```bash
 aws cloudformation create-stack \
   --stack-name glue-csv-workflow-cf \
@@ -407,24 +392,29 @@ delete a bucket unless every version and delete marker in it is gone too,
 so if you only run `s3 rm --recursive` the stack deletion will fail on the
 bucket resources with a `BucketNotEmpty` error.
 
-Purge every version (requires [jq](https://jqlang.github.io/jq/)):
+Purge every version using only the AWS CLI (no `jq`, no `python`, and using a
+local file rather than `/tmp` — on Windows with the native AWS CLI exe,
+Git Bash's `/tmp` isn't a path it can resolve):
 ```bash
 for BUCKET in upload-csv-cf destination-csv-cf; do
   aws s3api list-object-versions --bucket "$BUCKET" --output json \
-    | jq '{Objects: ((.Versions // []) + (.DeleteMarkers // [])) | map({Key, VersionId})}' \
-    > /tmp/delete-$BUCKET.json
+    --query "{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}" \
+    > "./delete-$BUCKET.json"
 
-  if [ "$(jq '.Objects | length' /tmp/delete-$BUCKET.json)" -gt 0 ]; then
-    aws s3api delete-objects --bucket "$BUCKET" --delete file:///tmp/delete-$BUCKET.json
+  if grep -q '"Key"' "./delete-$BUCKET.json"; then
+    aws s3api delete-objects --bucket "$BUCKET" --delete "file://delete-$BUCKET.json"
   fi
+  rm -f "./delete-$BUCKET.json"
 done
 
 aws cloudformation delete-stack --stack-name glue-csv-workflow-cf
 aws cloudformation wait stack-delete-complete --stack-name glue-csv-workflow-cf
 ```
 
-No `jq`? The AWS Console's **S3 → bucket → Empty** button does the same
-full-version purge for you, and is the easiest option for a one-off cleanup.
+This has been run end-to-end against real versioned objects and
+confirmed to fully empty both buckets and let the stack delete cleanly.
+
+*Note*: The AWS Console's **S3 → bucket → Empty** button does the same full-version purge.
 ---
 This is the payoff of using CloudFormation: one command removes every
 resource the project created — buckets, IAM role, Glue database, crawler,
