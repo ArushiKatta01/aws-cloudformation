@@ -16,6 +16,15 @@ on:
 permissions:
   contents: read
 
+# UPLOAD_BUCKET_NAME and AWS_REGION are plain (non-secret) config, so they're
+# repo/environment "Variables" (Settings -> Secrets and variables -> Actions
+# -> Variables tab), not Secrets - only the access key pair needs to stay
+# secret. UPLOAD_BUCKET_NAME must match the UploadBucketName parameter used
+# to deploy template.yaml, so renaming the bucket only means updating this
+# one variable instead of editing the workflow file.
+env:
+  UPLOAD_BUCKET_NAME: ${{ vars.UPLOAD_BUCKET_NAME }}
+
 jobs:
   upload-csv:
     runs-on: ubuntu-latest
@@ -33,7 +42,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       # Uploads every CSV under sample-data/ to the upload bucket's data/
       # prefix. That PutObject is what the S3 NotificationConfiguration in
@@ -42,6 +51,6 @@ jobs:
       # workflow's only job is "get the file into S3."
       - name: Sync CSVs to upload bucket
         run: |
-          aws s3 sync sample-data/ s3://upload-csv-cf/data/ \
+          aws s3 sync sample-data/ "s3://${UPLOAD_BUCKET_NAME}/data/" \
             --exclude "*" \
             --include "*.csv"

@@ -100,6 +100,8 @@ Resources:
   # write CloudWatch logs, and manage Glue Catalog entries. AWS ships a
   # managed policy (AWSGlueServiceRole) that covers the generic Glue
   # permissions; we add an inline policy for our specific S3 buckets.
+  # The job only ever reads source CSVs and writes output CSVs/manifest -
+  # it never deletes anything, so s3:DeleteObject is intentionally left out.
   # -------------------------------------------------------------------------
   GlueServiceRoleCF:
     Type: AWS::IAM::Role
@@ -123,7 +125,6 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                  - s3:DeleteObject
                   - s3:ListBucket
                 Resource:
                   - !Sub arn:aws:s3:::${UploadBucketName}

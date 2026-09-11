@@ -22,7 +22,6 @@ as **code** in `template.yaml` and deployed as one AWS CloudFormation stack.
 glue-workflow-cf/
 ├── template.yaml                    # Main CloudFormation template (S3, IAM, Glue, Lambda automation)
 ├── github-iam-user.yaml            # IAM user + scoped policy for GitHub Actions (static key auth)
-├── github-oidc-role.yaml           # Alternative: OIDC provider + role (no stored keys, more setup)
 ├── .github/
 │   └── workflows/
 │       └── upload-csv.yml          # GitHub Actions: uploads CSVs to S3 on push
@@ -120,7 +119,8 @@ git push (CSV under sample-data/ changed)
         │
         ▼
 GitHub Actions workflow (.github/workflows/upload-csv.yml)
-        │  authenticates via OIDC - no AWS keys stored in GitHub
+        │  authenticates via a static IAM user access key
+        │  (stored as GitHub Actions secrets)
         ▼
 aws s3 sync sample-data/ → s3://upload-csv-cf/data/
         │
@@ -169,13 +169,22 @@ This prints a JSON block containing `AccessKeyId` and `SecretAccessKey`.
 you lose it, delete that key (`aws iam delete-access-key`) and generate a
 new one.
 
-#### Setup: Step 3 — add GitHub repo secrets
+#### Setup: Step 3 — add GitHub repo secrets and variables
 
-In your repo: **Settings → Secrets and variables → Actions → New repository
-secret**, add three:
+In your repo: **Settings → Secrets and variables → Actions**.
+
+On the **Secrets** tab (these are sensitive - only the key pair needs to be
+here), add two:
 - `AWS_ACCESS_KEY_ID` — the `AccessKeyId` from Step 2
 - `AWS_SECRET_ACCESS_KEY` — the `SecretAccessKey` from Step 2
+
+On the **Variables** tab (not secret - just config the workflow reads),
+add two:
 - `AWS_REGION` — the region your stack is deployed in, e.g. `us-east-1`
+- `UPLOAD_BUCKET_NAME` — must match the `UploadBucketName` parameter you
+  deployed `template.yaml` with, e.g. `upload-csv-cf`. Keeping this as a
+  variable instead of hardcoding it in `upload-csv.yml` means renaming the
+  bucket only requires updating this one value.
 
 #### Setup: Step 4 — push and watch it run
 
@@ -335,20 +344,9 @@ aws s3 cp sample-data/sample.csv s3://upload-csv-cf/data/sample.csv
 
 ### Step 5: Run the workflow
 
-**If you're deploying this for the first time**, or already have the stack
-running, do this once to pick up the automation:
-
-```bash
-aws cloudformation update-stack \
-  --stack-name glue-csv-workflow-cf \
-  --template-body file://template.yaml \
-  --capabilities CAPABILITY_NAMED_IAM
-
-aws cloudformation wait stack-update-complete --stack-name glue-csv-workflow-cf
-```
-
-From here on, **you don't need to manually start anything** — uploading a
-CSV under `data/` is enough:
+The S3 → Lambda → Glue automation was already created along with everything
+else back in Step 2 — there's no separate step to "turn it on." **You don't
+need to manually start anything**: uploading a CSV under `data/` is enough:
 ```bash
 aws s3 cp sample-data/sample.csv s3://upload-csv-cf/data/sample2.csv
 ```
@@ -401,15 +399,32 @@ script's own `print()` output, confirming exactly what it read and wrote:
 
 ### Step 7: Tear it down (avoid ongoing charges)
 
-Empty both buckets first — CloudFormation cannot delete a non-empty S3
-bucket:
+Both buckets have versioning enabled, so `aws s3 rm --recursive` is **not**
+enough to empty them: it only deletes the current version of each object
+(actually just adding a delete marker on top of a versioned object) — the
+older versions and delete markers stay behind. CloudFormation refuses to
+delete a bucket unless every version and delete marker in it is gone too,
+so if you only run `s3 rm --recursive` the stack deletion will fail on the
+bucket resources with a `BucketNotEmpty` error.
+
+Purge every version (requires [jq](https://jqlang.github.io/jq/)):
 ```bash
-aws s3 rm s3://upload-csv-cf --recursive
-aws s3 rm s3://destination-csv-cf --recursive
+for BUCKET in upload-csv-cf destination-csv-cf; do
+  aws s3api list-object-versions --bucket "$BUCKET" --output json \
+    | jq '{Objects: ((.Versions // []) + (.DeleteMarkers // [])) | map({Key, VersionId})}' \
+    > /tmp/delete-$BUCKET.json
+
+  if [ "$(jq '.Objects | length' /tmp/delete-$BUCKET.json)" -gt 0 ]; then
+    aws s3api delete-objects --bucket "$BUCKET" --delete file:///tmp/delete-$BUCKET.json
+  fi
+done
 
 aws cloudformation delete-stack --stack-name glue-csv-workflow-cf
 aws cloudformation wait stack-delete-complete --stack-name glue-csv-workflow-cf
 ```
+
+No `jq`? The AWS Console's **S3 → bucket → Empty** button does the same
+full-version purge for you, and is the easiest option for a one-off cleanup.
 ---
 This is the payoff of using CloudFormation: one command removes every
 resource the project created — buckets, IAM role, Glue database, crawler,
