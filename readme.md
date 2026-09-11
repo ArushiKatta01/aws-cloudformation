@@ -419,3 +419,27 @@ confirmed to fully empty both buckets and let the stack delete cleanly.
 This is the payoff of using CloudFormation: one command removes every
 resource the project created — buckets, IAM role, Glue database, crawler,
 job, workflow, and triggers.
+
+---
+
+## Changelog: fixes from review
+
+- **Stack deletion on versioned buckets**: `aws s3 rm --recursive` only
+  removes current object versions, leaving old versions/delete markers
+  behind and causing `BucketNotEmpty` on stack delete. Teardown now purges
+  every version and delete marker first (verified end-to-end).
+- **`csv_transform_job.py` argument parsing**: restored
+  `awsglue.utils.getResolvedOptions` instead of a hand-rolled parser. The
+  real bug was that the options list didn't include every `--key` Glue
+  actually passes (`job-language`, `TempDir`), which makes `getopt` raise
+  "option not recognized" — not an inherent unreliability in Glue's parser.
+- **Hardcoded bucket name in `upload-csv.yml`**: bucket name now comes from
+  an `UPLOAD_BUCKET_NAME` repo variable instead of being hardcoded.
+  `AWS_REGION` moved from a Secret to a Variable, since it isn't sensitive.
+- **Reprocessing every file / mismatched-schema concatenation**: the job
+  now tracks a manifest of already-processed source keys (by ETag) and only
+  processes new/changed CSVs, writing one output file per source instead of
+  concatenating all sources into one wide table.
+- **Smaller fixes**: removed unneeded `s3:DeleteObject` from the Glue
+  role's policy; removed the pointless `update-stack` immediately after
+  `create-stack` 
