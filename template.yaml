@@ -147,6 +147,89 @@ Resources:
         Description: Glue Catalog database for the CloudFormation CSV workflow.
 
   # -------------------------------------------------------------------------
+  # SEED THE DATA PREFIX
+  # AWS::Glue::Crawler validates its S3 target AT CREATION TIME - on a brand
+  # new bucket, s3://<UploadBucketName>/<DataPrefix> doesn't exist yet (no
+  # object has ever been put there), so CloudFormation fails the crawler
+  # with a 404 and rolls back the whole stack. This tiny custom resource
+  # (Lambda-backed, like StartWorkflowFunctionCF below) puts a single
+  # zero-byte placeholder object at that prefix before the crawler is
+  # created, so the target exists regardless of whether you've uploaded
+  # real data yet.
+  # -------------------------------------------------------------------------
+  SeedDataPrefixRoleCF:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: seed-data-prefix-lambda-role-cf
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: seed-data-prefix-cf
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${UploadBucketName}/${DataPrefix}*
+
+  SeedDataPrefixFunctionCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: seed-data-prefix-cf
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SeedDataPrefixRoleCF.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+
+          import boto3
+
+          def send_response(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch log stream {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+              }).encode("utf-8")
+              req = urllib.request.Request(url=event["ResponseURL"], data=body, method="PUT")
+              req.add_header("content-type", "")
+              req.add_header("content-length", str(len(body)))
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      props = event["ResourceProperties"]
+                      boto3.client("s3").put_object(Bucket=props["Bucket"], Key=props["Key"], Body=b"")
+                  send_response(event, context, "SUCCESS")
+              except Exception as exc:
+                  print(f"ERROR: {exc}")
+                  send_response(event, context, "FAILED", str(exc))
+
+  SeedDataPrefixCF:
+    Type: Custom::SeedDataPrefix
+    Properties:
+      ServiceToken: !GetAtt SeedDataPrefixFunctionCF.Arn
+      Bucket: !Ref UploadBucketName
+      Key: !Ref DataPrefix
+    DependsOn: UploadBucket
+
+  # -------------------------------------------------------------------------
   # GLUE CRAWLER
   # Scans the upload bucket's data prefix, infers the CSV schema, and
   # registers/updates a table in the Glue Database above. NOTE: with a
@@ -170,7 +253,9 @@ Resources:
         DeleteBehavior: LOG
       Configuration: >
         {"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}
-    DependsOn: GlueDatabaseCF
+    DependsOn:
+      - GlueDatabaseCF
+      - SeedDataPrefixCF
 
   # -------------------------------------------------------------------------
   # GLUE JOB - PYTHON SHELL (strict, no Spark)
