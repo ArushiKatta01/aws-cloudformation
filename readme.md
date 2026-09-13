@@ -38,7 +38,7 @@ glue-workflow-cf/
 
 ---
 
-## Part 1 — Theory: what is CloudFormation, actually?
+## Theory: what is CloudFormation?
 
 *Concepts:*
 
@@ -49,9 +49,8 @@ glue-workflow-cf/
   the AWS API line by line ("imperative").
 - **Stack**: when you hand a template to CloudFormation, it creates a
   **stack** which is a single, trackable unit that groups all the resources the
-  template defines. Delete the stack, and (by default) every resource it
-  created is deleted too. This is the single biggest reason to use
-  CloudFormation: no orphaned resources, no manual cleanup.
+  template defines. Delete the stack, and every resource it
+  created is deleted by default. This means no orphaned resources and no manual cleanup.
 - **Resources**: each block under `Resources:` in the template maps to one
   real AWS object (`AWS::S3::Bucket`, `AWS::Glue::Job`, etc.). CloudFormation
   figures out the order to create them in based on references between them.
@@ -100,13 +99,13 @@ Two AWS concepts make this work:
 - **Resource-based permissions**: Lambda functions reject invocations from
   anything not explicitly allowed to call them. `AllowS3InvokeLambdaCF`
   (an `AWS::Lambda::Permission`) is what grants the S3 service permission
-  to invoke this specific function — this is separate from the Lambda's
+  to invoke this specific function. This is separate from the Lambda's
   *execution* role (which controls what the function itself is allowed to
   do once it's running).
 
 The Lambda's own IAM role is scoped narrowly: it can only call
 `glue:StartWorkflowRun` / `glue:GetWorkflowRuns` on this one workflow, and
-write its own CloudWatch logs — nothing more.
+write its own CloudWatch logs.
 
 ### Automating it further: push a CSV to GitHub, the pipeline runs
 
@@ -134,7 +133,7 @@ to become "the thing that uploads the file," using the same trigger path.
 #### Authenticating GitHub Actions to AWS: IAM user + access key
 
 This project authenticates GitHub Actions using a **static IAM user access
-key** — simpler to set up than OIDC federation, at the cost of the key
+key**. This is simpler to set up than OIDC federation, at the cost of the key
 being long-lived (it doesn't expire on its own; you rotate it yourself).
 The user's permissions are scoped as tightly as the task needs: it can only
 `s3:PutObject` into `upload-csv-cf/data/*` and `s3:ListBucket` on that one
@@ -165,22 +164,20 @@ aws iam create-access-key --user-name github-actions-upload-user-cf
 ![aws iam create-access-key command output](screenshots/terminal5.png)
 
 This prints a JSON block containing `AccessKeyId` and `SecretAccessKey`.
-**Copy both immediately** — the secret key is shown only this one time; if
-you lose it, delete that key (`aws iam delete-access-key`) and generate a
-new one.
+Both of these need to be **copied immediately** since the secret key is shown only this one time. If the 
+key is lost it should be deleted (`aws iam delete-access-key`) and a new one must be generated.
 
 #### Setup: Step 3 — add GitHub repo secrets and variables
 
-In your repo: **Settings → Secrets and variables → Actions**.
+In the repo: **Settings → Secrets and variables → Actions**.
 
 On the **Secrets** tab (these are sensitive - only the key pair needs to be
 here), add two:
 - `AWS_ACCESS_KEY_ID` — the `AccessKeyId` from Step 2
 - `AWS_SECRET_ACCESS_KEY` — the `SecretAccessKey` from Step 2
 
-On the **Variables** tab (not secret - just config the workflow reads),
-add two:
-- `AWS_REGION` — the region your stack is deployed in, e.g. `us-east-1`
+On the **Variables** tab:
+- `AWS_REGION` — the region the stack is deployed in
 - `UPLOAD_BUCKET_NAME` — must match the `UploadBucketName` parameter you
   deployed `template.yaml` with, e.g. `upload-csv-cf`. Keeping this as a
   variable instead of hardcoding it in `upload-csv.yml` means renaming the
@@ -194,14 +191,13 @@ git commit -m "Trigger pipeline via GitHub Actions"
 git push origin main
 ```
 The workflow only fires on pushes that touch a `.csv` under `sample-data/`
-(see the `paths` filter in `upload-csv.yml`) — editing the README or
-templates won't trigger it.
+(see the `paths` filter in `upload-csv.yml`)
 
 Watch it in the **Actions** tab of your repo
 
 ![GitHub Actions deploy pipeline run succeeded](screenshots/github-deploy.png)
 
-Once the Action completes, the same S3 → Lambda → Glue chain you already
+Once the Action completes, the same S3 → Lambda → Glue chain that is already
 verified takes over:
 ```bash
 aws logs tail /aws/lambda/start-csv-workflow-cf --since 5m --follow
@@ -212,8 +208,7 @@ aws glue get-workflow-runs --name csv-workflow-cf --max-results 1
 
 #### Note: Key rotation
 
-Since this key never expires automatically, put a reminder somewhere (a
-calendar note is fine) to rotate it periodically:
+This key never expires automatically:
 ```bash
 # create a new key, update the GitHub secrets with it, THEN deactivate/delete the old one
 aws iam create-access-key --user-name github-actions-upload-user-cf
@@ -242,7 +237,7 @@ with dependencies:
 [csv-transform-job-cf]  (reads the table, transforms, writes to destination-csv-cf)
 ```
 
-This mirrors exactly what you'd have built by hand in the console, just
+This mirrors exactly what was built by hand in the console, just
 captured as code.
 
 ---
@@ -251,11 +246,9 @@ captured as code.
 
 1. An AWS account with permissions to create S3 buckets, IAM roles, and Glue
    resources.
-2. [AWS CLI installed and configured](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-   (`aws configure`, using an IAM user/role with sufficient permissions) —
+2. AWS CLI installed and configured
+   (`aws configure`, using an IAM user/role with sufficient permissions) is
    only needed if you deploy via CLI rather than the console.
-3. Git, and a new empty GitHub repository to push this project into.
-
 ---
 
 ## Part 3 — Step-by-step deployment
@@ -307,7 +300,7 @@ aws glue get-job --job-name csv-transform-job-cf --query "Job.DefaultArguments"
 ### Step 3: Upload the Glue script to the newly-created upload bucket
 
 The Job resource pointed at `s3://upload-csv-cf/scripts/csv_transform_job.py`
-before that file existed — CloudFormation doesn't check the file is there at
+before that file existed. CloudFormation doesn't check the file is there at
 deploy time, only Glue checks it when the job actually *runs*. So now that
 the bucket exists, upload the script:
 
@@ -330,8 +323,8 @@ aws s3 cp sample-data/sample.csv s3://upload-csv-cf/data/sample.csv
 ### Step 5: Run the workflow
 
 The S3 → Lambda → Glue automation was already created along with everything
-else back in Step 2 — there's no separate step to "turn it on." **You don't
-need to manually start anything**: uploading a CSV under `data/` is enough:
+else back in Step 2. 
+**You don't need to manually start anything**: uploading a CSV under `data/` is enough:
 ```bash
 aws s3 cp sample-data/sample.csv s3://upload-csv-cf/data/sample2.csv
 ```
@@ -386,15 +379,12 @@ script's own `print()` output, confirming exactly what it read and wrote:
 
 Both buckets have versioning enabled, so `aws s3 rm --recursive` is **not**
 enough to empty them: it only deletes the current version of each object
-(actually just adding a delete marker on top of a versioned object) — the
-older versions and delete markers stay behind. CloudFormation refuses to
-delete a bucket unless every version and delete marker in it is gone too,
+(actually just adding a delete marker on top of a versioned object).
+CloudFormation refuses to delete a bucket unless every version and delete marker in it is gone too,
 so if you only run `s3 rm --recursive` the stack deletion will fail on the
 bucket resources with a `BucketNotEmpty` error.
 
-Purge every version using only the AWS CLI (no `jq`, no `python`, and using a
-local file rather than `/tmp` — on Windows with the native AWS CLI exe,
-Git Bash's `/tmp` isn't a path it can resolve):
+Purge every version using only the AWS CLI:
 ```bash
 for BUCKET in upload-csv-cf destination-csv-cf; do
   aws s3api list-object-versions --bucket "$BUCKET" --output json \
@@ -414,7 +404,7 @@ aws cloudformation wait stack-delete-complete --stack-name glue-csv-workflow-cf
 This has been run end-to-end against real versioned objects and
 confirmed to fully empty both buckets and let the stack delete cleanly.
 
-*Note*: The AWS Console's **S3 → bucket → Empty** button does the same full-version purge.
+**Note**: The AWS Console's **S3 → bucket → Empty** button does the same full-version purge.
 ---
 This is the payoff of using CloudFormation: one command removes every
 resource the project created — buckets, IAM role, Glue database, crawler,
@@ -422,7 +412,7 @@ job, workflow, and triggers.
 
 ---
 
-## Changelog: fixes from review
+## Fixes from review:
 
 - **Stack deletion on versioned buckets**: `aws s3 rm --recursive` only
   removes current object versions, leaving old versions/delete markers
